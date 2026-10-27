@@ -200,6 +200,7 @@ class CommandBuffer final : public WrappedObject<id<MTLCommandBuffer>>, angle::N
     void insertDebugSignpost(const std::string &marker);
     void pushDebugGroup(const std::string &marker);
     void popDebugGroup();
+    void markDrawnRenderEncoderForCapture();
 
     CommandQueue &cmdQueue() { return mCmdQueue; }
     const CommandQueue &cmdQueue() const { return mCmdQueue; }
@@ -260,6 +261,7 @@ class CommandBuffer final : public WrappedObject<id<MTLCommandBuffer>>, angle::N
     angle::HashSet<id> mResourceList;
     size_t mWorkingResourceSize              = 0;
     bool mCommitted                          = false;
+    bool mHasDrawnRenderEncoderForCapture    = false;
     CommandBufferFinishOperation mLastWaitOp = mtl::NoWait;
 };
 

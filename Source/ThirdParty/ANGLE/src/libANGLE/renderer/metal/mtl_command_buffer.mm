@@ -14,8 +14,14 @@
 
 #include "libANGLE/renderer/metal/mtl_command_buffer.h"
 
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <notify.h>
+
+#include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <mutex>
 #include <random>
 #include <type_traits>
 #include "mtl_command_buffer.h"
@@ -46,6 +52,158 @@ namespace mtl
 
 namespace
 {
+
+struct ANGLEFrameCapture
+{
+    enum class Mode
+    {
+        CommandBufferCount,
+        ScopeDrawnCommandBuffers,
+    };
+
+    static void registerForFrameCapture()
+    {
+        static std::once_flag onceFlag;
+        std::call_once(onceFlag, [] {
+            int captureFrameToken;
+            notify_register_dispatch("com.apple.WebKit.ANGLE.CaptureFrame", &captureFrameToken, dispatch_get_main_queue(), ^(int token) {
+                armCapture(Mode::CommandBufferCount, token);
+            });
+
+            int captureScopeToken;
+            notify_register_dispatch("com.apple.WebKit.ANGLE.CaptureFrameScope", &captureScopeToken, dispatch_get_main_queue(), ^(int token) {
+                armCapture(Mode::ScopeDrawnCommandBuffers, token);
+            });
+        });
+    }
+
+    static void armCapture(Mode mode, int token)
+    {
+        uint64_t state = 1;
+        notify_get_state(token, &state);
+        captureMode = mode;
+        maxCommandBuffersToCapture = std::max<int>(1, static_cast<int>(state));
+        commandBuffersCaptured = 0;
+        drawnCommandBuffersCaptured = 0;
+        captureArmed = true;
+    }
+
+    static void beginScopeIfNeeded(id<MTLCommandQueue> captureObject)
+    {
+        registerForFrameCapture();
+
+        if (captureMode.load() != Mode::ScopeDrawnCommandBuffers)
+            return;
+
+        if (!captureArmed.exchange(false))
+            return;
+
+        MTLCaptureManager *captureManager = [MTLCaptureManager sharedCaptureManager];
+        if ([captureManager isCapturing])
+            return;
+
+        activeCaptureScope = [captureManager newCaptureScopeWithCommandQueue:captureObject];
+        activeCaptureScope.label = @"ANGLE drawn command buffer capture";
+
+        MTLCaptureDescriptor *captureDescriptor = [[MTLCaptureDescriptor alloc] init];
+        captureDescriptor.captureObject = activeCaptureScope;
+        captureDescriptor.destination = MTLCaptureDestinationGPUTraceDocument;
+        captureDescriptor.outputURL = [[NSFileManager.defaultManager temporaryDirectory] URLByAppendingPathComponent:[NSString stringWithFormat:@"%@.gputrace", NSUUID.UUID.UUIDString]];
+
+        NSError *error;
+        if (![captureManager startCaptureWithDescriptor:captureDescriptor error:&error]) {
+            NSLog(@"Failed to start scoped ANGLE GPU frame capture at path %@, error %@", captureDescriptor.outputURL.absoluteString, error);
+            [activeCaptureScope release];
+            activeCaptureScope = nil;
+            return;
+        }
+
+        [activeCaptureScope beginScope];
+        commandBuffersCaptured = 0;
+        drawnCommandBuffersCaptured = 0;
+        captureActive = true;
+        NSLog(@"Success starting scoped ANGLE GPU frame capture at path %@ - drawn command buffer count = %d", captureDescriptor.outputURL.absoluteString, maxCommandBuffersToCapture.load());
+    }
+
+    static void startIfNeeded(id<MTLCommandQueue> captureObject, NSString *reason)
+    {
+        registerForFrameCapture();
+
+        if (captureMode.load() == Mode::ScopeDrawnCommandBuffers)
+            return;
+
+        if (!captureArmed.exchange(false))
+            return;
+
+        MTLCaptureManager *captureManager = [MTLCaptureManager sharedCaptureManager];
+        if ([captureManager isCapturing])
+            return;
+
+        MTLCaptureDescriptor *captureDescriptor = [[MTLCaptureDescriptor alloc] init];
+        captureDescriptor.captureObject = captureObject;
+        captureDescriptor.destination = MTLCaptureDestinationGPUTraceDocument;
+        captureDescriptor.outputURL = [[NSFileManager.defaultManager temporaryDirectory] URLByAppendingPathComponent:[NSString stringWithFormat:@"%@.gputrace", NSUUID.UUID.UUIDString]];
+
+        NSError *error;
+        if (![captureManager startCaptureWithDescriptor:captureDescriptor error:&error]) {
+            NSLog(@"Failed to start ANGLE GPU frame capture at path %@, error %@", captureDescriptor.outputURL.absoluteString, error);
+            return;
+        }
+
+        commandBuffersCaptured = 0;
+        captureActive = true;
+        NSLog(@"Success starting ANGLE GPU frame capture at path %@ - command buffer count = %d, reason = %@", captureDescriptor.outputURL.absoluteString, maxCommandBuffersToCapture.load(), reason);
+    }
+
+    static void stopAfterCommandBufferCommit(bool commandBufferHadDrawnRenderEncoder)
+    {
+        if (!captureActive)
+            return;
+
+        ++commandBuffersCaptured;
+
+        if (captureMode.load() == Mode::ScopeDrawnCommandBuffers) {
+            if (!commandBufferHadDrawnRenderEncoder)
+                return;
+
+            if (++drawnCommandBuffersCaptured < maxCommandBuffersToCapture)
+                return;
+
+            if (activeCaptureScope)
+                [activeCaptureScope endScope];
+        } else if (commandBuffersCaptured < maxCommandBuffersToCapture)
+            return;
+
+        MTLCaptureManager *captureManager = [MTLCaptureManager sharedCaptureManager];
+        if ([captureManager isCapturing])
+            [captureManager stopCapture];
+
+        commandBuffersCaptured = 0;
+        drawnCommandBuffersCaptured = 0;
+        captureActive = false;
+
+        if (activeCaptureScope) {
+            [activeCaptureScope release];
+            activeCaptureScope = nil;
+        }
+    }
+
+    static std::atomic<bool> captureArmed;
+    static std::atomic<bool> captureActive;
+    static std::atomic<Mode> captureMode;
+    static std::atomic<int> commandBuffersCaptured;
+    static std::atomic<int> drawnCommandBuffersCaptured;
+    static std::atomic<int> maxCommandBuffersToCapture;
+    static id<MTLCaptureScope> activeCaptureScope;
+};
+
+std::atomic<bool> ANGLEFrameCapture::captureArmed { false };
+std::atomic<bool> ANGLEFrameCapture::captureActive { false };
+std::atomic<ANGLEFrameCapture::Mode> ANGLEFrameCapture::captureMode { ANGLEFrameCapture::Mode::CommandBufferCount };
+std::atomic<int> ANGLEFrameCapture::commandBuffersCaptured { 0 };
+std::atomic<int> ANGLEFrameCapture::drawnCommandBuffersCaptured { 0 };
+std::atomic<int> ANGLEFrameCapture::maxCommandBuffersToCapture { 1 };
+id<MTLCaptureScope> ANGLEFrameCapture::activeCaptureScope = nil;
 
 #define ANGLE_MTL_CMD_X(PROC)                        \
     PROC(Invalid)                                    \
@@ -495,6 +653,7 @@ void CommandQueue::set(id<MTLCommandQueue> metalQueue)
 {
     finishAllCommands();
 
+    ANGLEFrameCapture::registerForFrameCapture();
     ParentClass::set(metalQueue);
 }
 
@@ -946,8 +1105,15 @@ uint64_t CommandBuffer::getQueueSerial() const
     return mQueueSerial;
 }
 
+void CommandBuffer::markDrawnRenderEncoderForCapture()
+{
+    mHasDrawnRenderEncoderForCapture = true;
+}
+
 void CommandBuffer::restart()
 {
+    ANGLEFrameCapture::beginScopeIfNeeded(mCmdQueue.get());
+
     uint64_t serial                                  = 0;
     angle::ObjCPtr<id<MTLCommandBuffer>> metalCmdBuffer = mCmdQueue.makeMetalCommandBuffer(&serial);
 
@@ -956,6 +1122,7 @@ void CommandBuffer::restart()
     set(metalCmdBuffer);
     mQueueSerial = serial;
     mCommitted   = false;
+    mHasDrawnRenderEncoderForCapture = false;
     mLastWaitOp  = mtl::NoWait;
 
     for (std::string &marker : mDebugGroups)
@@ -1132,6 +1299,7 @@ bool CommandBuffer::commitImpl()
     // Do the actual commit
     [get() enqueue];
     [get() commit];
+    ANGLEFrameCapture::stopAfterCommandBufferCommit(mHasDrawnRenderEncoderForCapture);
     // Reset the working resource set.
     clearResourceListAndSize();
     mCommitted = true;
@@ -1639,6 +1807,11 @@ void RenderCommandEncoder::encodeMetalEncoder()
     {
         ANGLE_MTL_LOG("Creating new render command encoder with desc: %@",
                       [mCachedRenderPassDescObjC description]);
+
+        if (hasDrawCalls()) {
+            cmdBuffer().markDrawnRenderEncoderForCapture();
+            ANGLEFrameCapture::startIfNeeded(cmdQueue().get(), @"render-command-encoder-with-draw");
+        }
 
         id<MTLRenderCommandEncoder> metalCmdEncoder =
             [cmdBuffer().get() renderCommandEncoderWithDescriptor:mCachedRenderPassDescObjC];
